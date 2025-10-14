@@ -15,6 +15,17 @@ module.exports = {
     timeColumn: process.env.TIME_COLUMN || null,
     filterClause: process.env.FILTER_CLAUSE || null,
   },
+  // Optional separate database for user subscriptions (defaults to 'user_data')
+  userDb: {
+    host: process.env.MSSQL_HOST || 'localhost',
+    port: parseInt(process.env.MSSQL_PORT || '1433', 10),
+    user: process.env.MSSQL_USER || 'sa',
+    password: process.env.MSSQL_PASSWORD || '',
+    database: process.env.USER_DATA_DATABASE || 'user_data',
+    options: {
+      encrypt: process.env.USER_DB_ENCRYPT === 'true'
+    }
+  },
   pollIntervalSec: parseInt(process.env.POLL_INTERVAL || '10', 10),
   line: {
     channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',

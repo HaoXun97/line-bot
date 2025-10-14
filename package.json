@@ -1,7 +1,7 @@
 {
   "name": "mssql-line-monitor",
   "version": "1.0.0",
-  "type": "module",
+  "type": "commonjs",
   "description": "Poll MS SQL for new rows and push messages via LINE Bot",
   "main": "index.js",
   "scripts": {

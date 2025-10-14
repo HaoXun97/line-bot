@@ -2,6 +2,9 @@ const sql = require("mssql");
 const line = require("@line/bot-sdk");
 const fs = require("fs");
 const path = require("path");
+const crypto = require('crypto');
+const dotenv = require('dotenv');
+dotenv.config();
 const config = require("./config");
 
 const lineClient = new line.Client({
@@ -57,6 +60,10 @@ function saveUserIdToFile(userId) {
 
 let lastSeenId = null;
 let seenSignalValue = null; // to avoid duplicate pushes if same signal repeats
+// Shared DB pool to avoid creating multiple pools
+let dbPool = null;
+// separate pool for user DB (subscriptions)
+let userDbPool = null;
 
 // Load Flex templates (buy/sell)
 const templateDir = path.join(__dirname, "template");
@@ -68,6 +75,57 @@ try {
   );
 } catch (e) {
   console.warn("Could not load buy template:", e && e.message ? e.message : e);
+}
+
+// In-memory pending state for conversation flows (from send.js)
+const pending = new Map(); // userId -> state (true or { unsubscribe: true })
+
+// helper DB functions for subscriptions (adapted from send.js)
+async function saveSubscription(userId, stockCode) {
+  const pool = await connectUserDB();
+  // make sure Subscriptions table exists to avoid runtime errors when handling subscription flows
+  await ensureSubscriptionsTable(pool);
+  const request = pool.request();
+  await request
+    .input("userId", sql.NVarChar(100), userId)
+    .input("stockCode", sql.NVarChar(50), stockCode)
+    .input("createdAt", sql.DateTime2, new Date())
+    .query(
+      `INSERT INTO [dbo].[Subscriptions] (UserId, StockCode, CreatedAt) VALUES (@userId, @stockCode, @createdAt)`
+    );
+}
+
+async function subscriptionExists(userId, stockCode) {
+  const pool = await connectUserDB();
+  await ensureSubscriptionsTable(pool);
+  const request = pool.request();
+  const result = await request
+    .input("userId", sql.NVarChar(100), userId)
+    .input("stockCode", sql.NVarChar(50), stockCode)
+    .query(`SELECT COUNT(1) AS cnt FROM [dbo].[Subscriptions] WHERE UserId = @userId AND StockCode = @stockCode`);
+  const cnt = result && result.recordset && result.recordset[0] && result.recordset[0].cnt;
+  return cnt > 0;
+}
+
+async function deleteSubscription(userId, stockCode) {
+  const pool = await connectUserDB();
+  await ensureSubscriptionsTable(pool);
+  const request = pool.request();
+  const result = await request
+    .input("userId", sql.NVarChar(100), userId)
+    .input("stockCode", sql.NVarChar(50), stockCode)
+    .query(`DELETE FROM [dbo].[Subscriptions] WHERE UserId = @userId AND StockCode = @stockCode`);
+  return (result && result.rowsAffected && result.rowsAffected[0]) || 0;
+}
+
+async function deleteAllSubscriptions(userId) {
+  const pool = await connectUserDB();
+  await ensureSubscriptionsTable(pool);
+  const request = pool.request();
+  const result = await request
+    .input("userId", sql.NVarChar(100), userId)
+    .query(`DELETE FROM [dbo].[Subscriptions] WHERE UserId = @userId`);
+  return (result && result.rowsAffected && result.rowsAffected[0]) || 0;
 }
 try {
   sellTemplate = JSON.parse(
@@ -111,6 +169,8 @@ process.on("uncaughtException", (err) => {
 });
 
 async function connectDB() {
+  if (dbPool) return dbPool;
+
   const pool = new sql.ConnectionPool({
     user: config.mssql.user,
     password: config.mssql.password,
@@ -128,7 +188,48 @@ async function connectDB() {
   });
 
   await pool.connect();
-  return pool;
+  dbPool = pool;
+  return dbPool;
+}
+
+async function connectUserDB() {
+  if (userDbPool) return userDbPool;
+  const userCfg = config.userDb || {};
+  const pool = new sql.ConnectionPool({
+    user: userCfg.user,
+    password: userCfg.password,
+    server: userCfg.host,
+    port: userCfg.port,
+    database: userCfg.database,
+    options: {
+      encrypt: userCfg.options && userCfg.options.encrypt,
+      enableArithAbort: true,
+    },
+  });
+  pool.on('error', (err) => console.error('User DB pool error', err));
+  await pool.connect();
+  userDbPool = pool;
+  return userDbPool;
+}
+
+// Ensure Subscriptions table exists (create if missing)
+async function ensureSubscriptionsTable(pool) {
+  try {
+    const createSql = `IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Subscriptions]') AND type in (N'U'))
+BEGIN
+  CREATE TABLE dbo.Subscriptions (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    UserId NVARCHAR(100) NOT NULL,
+    StockCode NVARCHAR(50) NOT NULL,
+    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+  CREATE UNIQUE INDEX UX_Subscriptions_UserId_StockCode ON dbo.Subscriptions(UserId, StockCode);
+END`;
+    await pool.request().query(createSql);
+    console.log('Ensured Subscriptions table exists (or already existed)');
+  } catch (err) {
+    console.warn('Could not ensure Subscriptions table:', err && err.message ? err.message : err);
+  }
 }
 
 function buildQuery() {
@@ -247,7 +348,22 @@ async function poll(pool) {
           "Sending LINE message for latest row with signal=",
           signalVal
         );
-        await sendLineMessage(messageToSend);
+        // Try to determine stock code field from the row using common names
+        const possibleKeys = ['symbol', 'Symbol', 'stock', 'StockCode', 'stockCode', 'symbolCode', 'code'];
+        let stockCode = null;
+        for (const k of possibleKeys) {
+          if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') {
+            stockCode = String(row[k]).trim();
+            break;
+          }
+        }
+
+        if (stockCode) {
+          await sendToSubscribers(messageToSend, stockCode);
+        } else {
+          // fallback: broadcast to all saved users
+          await sendLineMessage(messageToSend);
+        }
         seenSignalValue = signalVal;
       }
 
@@ -326,33 +442,111 @@ async function sendLineMessage(text) {
   }
 }
 
-// Webhook route to accept LINE events (needs channelSecret configured)
-if (config.line.channelSecret) {
-  app.post('/webhook', line.middleware({ channelSecret: config.line.channelSecret }), async (req, res) => {
-    const events = req.body && req.body.events ? req.body.events : [];
-    console.log('Webhook /webhook called - events:', events && events.length ? events.length : 0);
-    try {
-      fs.appendFileSync(path.join(__dirname, 'webhook.log'), `[${new Date().toISOString()}] /webhook events=${events.length}\n`);
-    } catch (e) {
-      console.error('Failed to append webhook.log', e && e.message ? e.message : e);
-    }
-    for (const ev of events) {
+// Query subscriptions table for users subscribed to a particular stock code
+async function getSubscribersByStock(stockCode) {
+  try {
+    const pool = await connectUserDB();
+    await ensureSubscriptionsTable(pool);
+    const request = pool.request();
+    const res = await request
+      .input('stockCode', sql.NVarChar(50), stockCode)
+      .query(`SELECT UserId FROM [dbo].[Subscriptions] WHERE StockCode = @stockCode`);
+    if (!res.recordset) return [];
+    return res.recordset.map(r => String(r.UserId).trim()).filter(u => !!u);
+  } catch (err) {
+    console.error('Failed to query subscribers for', stockCode, err && err.message ? err.message : err);
+    return [];
+  }
+}
+
+// Send a message only to users subscribed to the given stockCode. Falls back to global push
+async function sendToSubscribers(message, stockCode) {
+  if (!config.line.channelAccessToken) {
+    console.warn('LINE credentials missing; skipping send.');
+    return;
+  }
+
+  // if stockCode not provided, fallback to broadcasting to all users
+  if (!stockCode) {
+    return sendLineMessage(message);
+  }
+
+  const userIds = await getSubscribersByStock(stockCode);
+  if (!userIds || !userIds.length) {
+    console.log(`No subscribers found for ${stockCode}; skipping push`);
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, config.sendDelayMs || 200));
+
+  for (const userId of userIds) {
+    console.log(`推播給訂閱 ${stockCode} 的 userId: ${userId}`);
+    let attempt = 0;
+    while (attempt <= (config.lineMaxRetries || 5)) {
       try {
-        // handle follow (add friend) event
-        if (ev.type === 'follow' && ev.source && ev.source.userId) {
-          saveUserIdToFile(ev.source.userId);
+        const res = await lineClient.pushMessage(userId, typeof message === 'string' ? { type: 'text', text: message } : message);
+        console.debug(`LINE push response for user ${userId}:`, res);
+        break;
+      } catch (err) {
+        attempt += 1;
+        const status = err && err.statusCode ? err.statusCode : err && err.status ? err.status : null;
+        console.warn(`LINE send attempt ${attempt} failed for user ${userId}`, status || '', err && err.message ? err.message : err);
+        if (status === 429 && attempt <= (config.lineMaxRetries || 5)) {
+          const wait = (config.lineRetryBaseMs || 500) * Math.pow(2, attempt - 1);
+          console.log(`Rate limited. Backing off ${wait}ms before retrying (attempt ${attempt})`);
+          await new Promise((r) => setTimeout(r, wait));
+          continue;
         }
-        // other events can be added here
-      } catch (e) {
-        console.error('Error handling event', e && e.message ? e.message : e);
+        console.error(`LINE send error for user ${userId}:`, err);
+        break;
       }
     }
-    // always return 200 quickly
-    res.status(200).send('OK');
+  }
+}
+
+// Webhook route to accept LINE events (needs channelSecret configured)
+// We'll implement two webhook routes:
+//  - /webhook: verifies signature using channelSecret and expects raw body
+//  - /webhook-dev: optional dev route that accepts JSON without signature when ALLOW_UNVERIFIED_WEBHOOK=true
+if (config.line.channelSecret) {
+  app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const signature = req.headers['x-line-signature'];
+    const body = req.body; // Buffer
+
+    try {
+      if (!signature) {
+        console.warn('No x-line-signature header');
+        return res.status(400).send('Missing signature');
+      }
+
+      const computed = crypto.createHmac('sha256', config.line.channelSecret).update(body).digest('base64');
+
+      const sigBuf = Buffer.from(signature);
+      const compBuf = Buffer.from(computed);
+      if (sigBuf.length !== compBuf.length || !crypto.timingSafeEqual(sigBuf, compBuf)) {
+        console.error('Signature validation failed', { signature, computed });
+        return res.status(401).send('SignatureValidationFailed');
+      }
+
+      const parsed = JSON.parse(body.toString());
+      const events = parsed.events || [];
+      try {
+        fs.appendFileSync(path.join(__dirname, 'webhook.log'), `[${new Date().toISOString()}] /webhook events=${events.length} body=${JSON.stringify(parsed)}\n`);
+      } catch (e) {
+        console.error('Failed to append webhook.log', e && e.message ? e.message : e);
+      }
+
+      // handle events concurrently but don't let one failure crash the handler
+      const results = await Promise.allSettled(events.map(handleEvent));
+      const normalized = results.map((r) => (r.status === 'fulfilled' ? r.value : { error: String(r.reason) }));
+      return res.json(normalized);
+    } catch (err) {
+      console.error('Webhook processing error:', err);
+      return res.status(500).send('Internal Server Error');
+    }
   });
 
-  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-  app.listen(port, () => console.log(`Webhook server listening on port ${port}`));
+  console.log('Webhook /webhook enabled (signature verification)');
 } else {
   console.warn('LINE channel secret not configured; webhook endpoint not started. Set LINE_CHANNEL_SECRET in environment to enable it.');
 }
@@ -360,7 +554,7 @@ if (config.line.channelSecret) {
 // Development helper: allow posting to /webhook-dev without signature verification
 // Enable by setting ALLOW_UNVERIFIED_WEBHOOK=true in .env (do NOT enable in production)
 if (process.env.ALLOW_UNVERIFIED_WEBHOOK === 'true') {
-  app.post('/webhook-dev', express.json(), (req, res) => {
+  app.post('/webhook-dev', express.json(), async (req, res) => {
     const events = req.body && req.body.events ? req.body.events : [];
     console.log('Dev webhook /webhook-dev called - events:', events && events.length ? events.length : 0);
     try {
@@ -368,18 +562,152 @@ if (process.env.ALLOW_UNVERIFIED_WEBHOOK === 'true') {
     } catch (e) {
       console.error('Failed to append webhook.log', e && e.message ? e.message : e);
     }
-    for (const ev of events) {
-      try {
-        if (ev.type === 'follow' && ev.source && ev.source.userId) {
-          saveUserIdToFile(ev.source.userId);
-        }
-      } catch (e) {
-        console.error('Error handling dev event', e && e.message ? e.message : e);
-      }
-    }
-    res.status(200).send('OK');
+    // handle events
+    const results = await Promise.allSettled(events.map(handleEvent));
+    const normalized = results.map((r) => (r.status === 'fulfilled' ? r.value : { error: String(r.reason) }));
+    res.json(normalized);
   });
   console.log('Dev unverified webhook /webhook-dev enabled (ALLOW_UNVERIFIED_WEBHOOK=true)');
+}
+
+// shared event handler logic (from send.js)
+async function handleEvent(event) {
+  try {
+    if (event.type === 'follow' && event.source && event.source.userId) {
+      saveUserIdToFile(event.source.userId);
+      return { ok: true };
+    }
+
+    if (event.type !== 'message' || !event.message || event.message.type !== 'text') {
+      return { ok: true };
+    }
+
+    const userId = event.source.userId;
+    const userMessage = event.message.text && event.message.text.trim();
+
+    console.log('使用者ID:', userId);
+    console.log('訊息內容:', userMessage);
+
+    if (userMessage === '訂閱股票') {
+      pending.set(userId, true);
+      const reply = { type: 'text', text: '請輸入要訂閱的股票代號（例如 2330）：' };
+      await lineClient.replyMessage(event.replyToken, reply);
+      return { ok: true };
+    }
+
+    if (userMessage === '取消訂閱股票') {
+      pending.set(userId, { unsubscribe: true });
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: '請輸入要取消訂閱的股票代號（例如 2330, 或輸入「全部」以取消所有訂閱）：' });
+      return { ok: true };
+    }
+
+    if (pending.has(userId)) {
+      const state = pending.get(userId);
+      const raw = userMessage || '';
+      const parts = raw.split(/[;,\s，、]+/).map((p) => p.trim()).filter(Boolean);
+
+      if (parts.length === 0) {
+        await lineClient.replyMessage(event.replyToken, { type: 'text', text: '未偵測到有效的股票代號，請重新輸入（例如：2330 或可同時輸入 2330, 9950）：' });
+        return { ok: true };
+      }
+
+      const MAX_CODES = 20;
+      if (parts.length > MAX_CODES) {
+        await lineClient.replyMessage(event.replyToken, { type: 'text', text: `一次最多只能訂閱 ${MAX_CODES} 個代號，請分批輸入。` });
+        return { ok: true };
+      }
+
+      const validRegex = /^[A-Za-z0-9\.\-]{1,20}$/;
+      const uniqueCodes = Array.from(new Set(parts.map((p) => p.toUpperCase())));
+
+      if (state && state.unsubscribe && uniqueCodes.length === 1 && (uniqueCodes[0] === '全部' || uniqueCodes[0] === 'ALL')) {
+        try {
+          const count = await deleteAllSubscriptions(userId);
+          const msg = count > 0 ? `已取消所有訂閱，共 ${count} 筆。` : `找不到任何訂閱可以取消。`;
+          await lineClient.replyMessage(event.replyToken, { type: 'text', text: msg });
+        } catch (err) {
+          console.error('Failed to delete all subscriptions:', err);
+          await lineClient.replyMessage(event.replyToken, { type: 'text', text: '刪除所有訂閱時發生錯誤，請稍後再試。' });
+        }
+        pending.delete(userId);
+        return { ok: true };
+      }
+
+      const added = [];
+      const skipped = [];
+      const failed = [];
+      const removed = [];
+
+      for (const code of uniqueCodes) {
+        if (!validRegex.test(code)) {
+          skipped.push({ code, reason: '格式不符' });
+          continue;
+        }
+
+        try {
+          let exists = false;
+          try {
+            exists = await subscriptionExists(userId, code);
+          } catch (dbErr) {
+            console.error('DB check failed:', dbErr);
+            failed.push({ code, reason: '資料庫連線失敗' });
+            continue;
+          }
+
+          if (state && state.unsubscribe) {
+            try {
+              const affected = await deleteSubscription(userId, code);
+              if (affected > 0) removed.push(code);
+              else skipped.push({ code, reason: '不存在' });
+            } catch (delErr) {
+              console.error('Failed to delete subscription for', code, delErr);
+              failed.push({ code, reason: delErr.message || '刪除失敗' });
+            }
+          } else {
+            if (exists) {
+              skipped.push({ code, reason: '已存在' });
+              continue;
+            }
+
+            try {
+              await saveSubscription(userId, code);
+              added.push(code);
+            } catch (saveErr) {
+              console.error('Failed to save subscription for', code, saveErr);
+              failed.push({ code, reason: saveErr.message || '未知錯誤' });
+            }
+          }
+        } catch (err) {
+          console.error('Unexpected error handling code', code, err);
+          failed.push({ code, reason: '內部錯誤' });
+        }
+      }
+
+      const lines = [];
+      if (state && state.unsubscribe) {
+        if (removed.length) lines.push(`已取消訂閱: ${removed.join(', ')}`);
+        if (skipped.length) lines.push(`略過: ${skipped.map(s => `${s.code}(${s.reason})`).join(', ')}`);
+        if (failed.length) lines.push(`失敗: ${failed.map(f => `${f.code}(${f.reason})`).join(', ')}`);
+        if (lines.length === 0) lines.push('未取消任何訂閱。');
+      } else {
+        if (added.length) lines.push(`已新增訂閱: ${added.join(', ')}`);
+        if (skipped.length) lines.push(`略過: ${skipped.map(s => `${s.code}(${s.reason})`).join(', ')}`);
+        if (failed.length) lines.push(`失敗: ${failed.map(f => `${f.code}(${f.reason})`).join(', ')}`);
+        if (lines.length === 0) lines.push('未新增任何訂閱。');
+      }
+
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: lines.join('\n') });
+      pending.delete(userId);
+      return { ok: true };
+    }
+
+    // default: echo
+    await lineClient.replyMessage(event.replyToken, { type: 'text', text: `收到您的訊息！\n內容: ${userMessage}` });
+    return { ok: true };
+  } catch (error) {
+    console.error('處理事件時發生錯誤:', error);
+    return { error: String(error) };
+  }
 }
 
 async function start() {
@@ -449,3 +777,7 @@ start().catch((err) => {
   console.error("Fatal error", err);
   process.exit(1);
 });
+
+// Start express server for webhook routes (if any). Keep port consistent with previous behavior.
+const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+app.listen(port, () => console.log(`Express server listening on port ${port}`));
