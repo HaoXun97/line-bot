@@ -6,7 +6,7 @@
     "contents": [
       {
         "type": "text",
-        "text": "{{symbol}} 買入建議",
+        "text": "{{symbol}} 買入訊號",
         "weight": "bold",
         "size": "xl"
       },

@@ -37,22 +37,22 @@ node index.js
 
 ## 環境變數設定
 
-| 變數名稱 | 說明 | 預設值 |
-|---------|------|--------|
-| `MSSQL_HOST` | MSSQL 伺服器位址 | localhost |
-| `MSSQL_PORT` | MSSQL 連接埠 | 1433 |
-| `MSSQL_USER` | 資料庫使用者名稱 | sa |
-| `MSSQL_PASSWORD` | 資料庫密碼 | |
-| `MSSQL_DATABASE` | 主要資料庫名稱 | market_stock_tw |
-| `MSSQL_TABLE` | 交易訊號資料表 | trade_signals_1d |
-| `USER_DATA_DATABASE` | 用戶資料庫名稱 | user_data |
-| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Bot 存取權杖 | |
-| `LINE_CHANNEL_SECRET` | LINE Bot 頻道密鑰 | |
-| `POLL_INTERVAL` | 輪詢間隔（秒） | 10 |
-| `ID_COLUMN` | 主鍵欄位名稱 | id |
-| `SIGNAL_COLUMN` | 交易訊號欄位名稱 | Trade_Signal |
-| `MESSAGE_TEMPLATE` | 訊息模板 | 【{{symbol}}】{{Trade_Signal}} at {{close_price}} |
-| `PORT` | 伺服器連接埠 | 3000 |
+| 變數名稱                    | 說明              | 預設值                                            |
+| --------------------------- | ----------------- | ------------------------------------------------- |
+| `MSSQL_HOST`                | MSSQL 伺服器位址  | localhost                                         |
+| `MSSQL_PORT`                | MSSQL 連接埠      | 1433                                              |
+| `MSSQL_USER`                | 資料庫使用者名稱  | sa                                                |
+| `MSSQL_PASSWORD`            | 資料庫密碼        |                                                   |
+| `MSSQL_DATABASE`            | 主要資料庫名稱    | market_stock_tw                                   |
+| `MSSQL_TABLE`               | 交易訊號資料表    | trade_signals_1d                                  |
+| `USER_DATA_DATABASE`        | 用戶資料庫名稱    | user_data                                         |
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Bot 存取權杖 |                                                   |
+| `LINE_CHANNEL_SECRET`       | LINE Bot 頻道密鑰 |                                                   |
+| `POLL_INTERVAL`             | 輪詢間隔（秒）    | 10                                                |
+| `ID_COLUMN`                 | 主鍵欄位名稱      | id                                                |
+| `SIGNAL_COLUMN`             | 交易訊號欄位名稱  | Trade_Signal                                      |
+| `MESSAGE_TEMPLATE`          | 訊息模板          | 【{{symbol}}】{{Trade_Signal}} at {{close_price}} |
+| `PORT`                      | 伺服器連接埠      | 3000                                              |
 
 ## 資料庫結構
 

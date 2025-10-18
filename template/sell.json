@@ -6,7 +6,7 @@
     "contents": [
       {
         "type": "text",
-        "text": "{{symbol}} 賣出建議",
+        "text": "{{symbol}} 賣出訊號",
         "weight": "bold",
         "size": "xl"
       },
